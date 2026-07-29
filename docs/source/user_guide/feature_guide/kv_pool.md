@@ -729,32 +729,44 @@ echo "vLLM started. Log file: log_mix.log"
 
 #### Configuration
 
-Starting from the `mmc-local.conf` configured in [Configuring the memcache Config File](#configuring-the-memcache-config-file), add the following SSD cache fields:
+Starting from the configuration files described in [Configuring the memcache Config File](#configuring-the-memcache-config-file), add the following SSD cache fields.
 
-```shell
+Add the following fields to `mmc-local.conf`:
+
+```ini
 ock.mmc.local_service.storage.enabled = true
 ubsio.disk.path = /dev/nvmexn1:/dev/nvmexn2:/dev/nvmexn3:/dev/nvmexn4:/dev/nvmexn5:/dev/nvmexn6:/dev/nvmexn7:/dev/nvmexn8
 ubsio.mem.size_in_gb = 10
 ubsio.standalone.device_count = 8
 ```
 
-When starting vLLM, explicitly set `UBSIO_CONFIG_PATH` to the same file as `MMC_LOCAL_CONFIG_PATH`:
+Add the following fields to `mmc-meta.conf`:
 
-```shell
-export UBSIO_CONFIG_PATH=${MMC_LOCAL_CONFIG_PATH}
+```ini
+# Put operations trigger eviction when space usage reaches the high watermark
+ock.mmc.evict_threshold_high = 70
+
+# Eviction stops after space usage drops to the low watermark
+ock.mmc.evict_threshold_low = 60
+
+# SSD data is rewarmed to DRAM when DRAM usage exceeds this watermark
+ock.mmc.rewarm.dram_watermark = 95
 ```
 
-| Field | Description |
-| :--- | :--- |
-| `ock.mmc.local_service.storage.enabled` | Set to `true` to enable SSD caching. |
-| `ubsio.disk.path` | **Required when SSD caching is enabled. The configured SSDs or partitions must be exclusively used by UBS IO and must not have any mount points.** Separate multiple paths with colons (`:`). |
-| `ubsio.mem.size_in_gb` | Per-process UBS IO memory pool size in GB. The recommended value is `10`. The supported range is an integer from `0` to `1024`; SSD caching requires at least `5` GB per process. The total allocation must not exceed the node memory available after reserving memory for the operating system, vLLM, and the Memcache DRAM pool. |
-| `ubsio.standalone.device_count` | Number of local services whose `ock.mmc.local_service.dram.size` is not `0`. |
+| Field                                   | Description                                                                                                                                                                                                                                                                                                                         |
+| :-------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ock.mmc.local_service.storage.enabled` | Set to `true` to enable SSD caching.                                                                                                                                                                                                                                                                                                |
+| `ubsio.disk.path`                       | **Required when SSD caching is enabled. The configured SSDs or partitions must be exclusively used by UBS IO and must not have any mount points.** Separate multiple paths with colons (`:`).                                                                                                                                       |
+| `ubsio.mem.size_in_gb`                  | Per-process UBS IO memory pool size in GB. The recommended value is `10`. The supported range is an integer from `0` to `3072`; SSD caching requires at least `5` GB per process. The total allocation must not exceed the node memory available after reserving memory for the operating system, vLLM, and the Memcache DRAM pool. |
+| `ubsio.standalone.device_count`         | Number of local services whose `ock.mmc.local_service.dram.size` is not `0`.                                                                                                                                                                                                                                                        |
+| `ock.mmc.evict_threshold_high`          | Integer from `1` to `99`; the default is `90`. Set it to `70` for SSD caching. A `Put` operation triggers eviction when space usage reaches this high watermark. Eviction cannot be triggered when the data size of a single `Put` exceeds 1% of the capacity.                                                                      |
+| `ock.mmc.evict_threshold_low`           | Integer from `1` to `98`; the default is `80`. Set it to `60` for SSD caching. Eviction stops after space usage drops to this low watermark.                                                                                                                                                                                        |
+| `ock.mmc.rewarm.dram_watermark`         | Integer from `0` to `100`; the default is `95`. SSD data is rewarmed to DRAM when DRAM usage exceeds this watermark.                                                                                                                                                                                                                |
 
-When adjusting the recommended value, calculate the maximum permitted per-process value by dividing the node memory available to UBS IO by the number of DRAM-enabled local services, rounding down, and capping the result at `1024`:
+When adjusting the recommended value, calculate the maximum permitted per-process value by dividing the node memory available to UBS IO by the number of DRAM-enabled local services, rounding down, and capping the result at `3072`:
 
 ```text
-maximum ubsio.mem.size_in_gb = min(1024, floor(available node memory for UBS IO (GB) / number of DRAM-enabled local services))
+maximum ubsio.mem.size_in_gb = min(3072, floor(available node memory for UBS IO (GB) / number of DRAM-enabled local services))
 ```
 
 For example, if `200` GB is available to UBS IO and four local services have DRAM enabled, the upper limit is `50` GB per process, so the recommended value `ubsio.mem.size_in_gb = 10` is valid. If the calculated upper limit is less than `5`, free more node memory or reduce the number of DRAM-enabled local services.
