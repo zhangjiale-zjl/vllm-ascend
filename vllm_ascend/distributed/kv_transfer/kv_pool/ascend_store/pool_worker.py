@@ -487,6 +487,7 @@ class KVPoolWorker:
         # per step via .clear() in process_layer_data().
         self._step_keyinfo_cache: dict[str, Any] = {}
         self._step_lease_result: dict[str, int] = {}
+        self._step_save_lease_keys: set[str] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -1703,6 +1704,40 @@ class KVPoolWorker:
                 # reused as a batch_copy write target.
                 self._allocated_gvas[key] = 0
 
+    def _pin_reused_save_gvas(self, keys: list[str]) -> list[str]:
+        """Register reused destinations in the client and pin their current GVAs."""
+        pinned = getattr(self, "_step_save_lease_keys", set())
+        self._step_save_lease_keys = pinned
+        new_keys = list(dict.fromkeys(key for key in keys if key not in pinned))
+        if new_keys:
+            results = require_aligned_batch_results(
+                "batch_add_lease", new_keys, self.m_store.batch_add_lease(new_keys, LAYERWISE_READ_LEASE_TTL_MS)
+            )
+            acquired = [key for key, result in zip(new_keys, results, strict=True) if result == 0]
+            try:
+                # Metadata queried before AddLease may describe a recycled GVA.
+                # AddLease also restores the SDK's local tracker registration;
+                # a metadata-only query cannot make batch_copy writable.
+                infos = self.m_store.batch_get_key_info(acquired) if acquired else []
+                if infos is None or len(infos) != len(acquired):
+                    raise RuntimeError("MemCache pinned save key-info result count mismatch")
+                for key, info in zip(acquired, infos, strict=True):
+                    addresses = info.gva_list() if info is not None and info.size() > 0 else []
+                    self._allocated_gvas[key] = next((gva for gva in (addresses or []) if gva > 0), 0)
+                    self._step_keyinfo_cache[key] = info
+                for key, result in zip(new_keys, results, strict=True):
+                    if result != 0:
+                        # This is an optional duplicate save of a cached block.
+                        # Never copy using an address without a client lease.
+                        self._allocated_gvas[key] = 0
+                        logger.warning("Skipping reused save GVA without a lease: key=%s result=%d", key, result)
+            except Exception:
+                if acquired:
+                    self.m_store.batch_remove_lease(acquired)
+                raise
+            pinned.update(acquired)
+        return [key for key in dict.fromkeys(keys) if key in pinned]
+
     def _alloc_gvas_for_save(self, requests: list[ReqMeta]) -> None:
         """Allocate per-group GVA on the worker side right before batch_copy.
 
@@ -1723,6 +1758,7 @@ class KVPoolWorker:
             all_group_gvas: list[np.ndarray] = []
             all_group_block_ids: list[np.ndarray] = []
             all_group_save_keys: list[str] = []
+            all_group_save_lease_keys: list[str] = []
             request.partial_save_gva_per_group = [0] * self.num_kv_cache_groups
             for group_id in range(self.num_kv_cache_groups):
                 block_ids_by_group = (
@@ -1783,6 +1819,9 @@ class KVPoolWorker:
                         break
                 transfer_blocks = candidate_blocks[allocated_prefix:]
 
+                reused_keys = [key for key in candidate_keys[allocated_prefix:] if self._allocated_gvas.get(key, 0) > 0]
+                all_group_save_lease_keys.extend(self._pin_reused_save_gvas(reused_keys))
+
                 block_gvas: list[int] = []
                 new_keys: list[str] = []
                 new_positions: list[int] = []
@@ -1790,7 +1829,7 @@ class KVPoolWorker:
                     key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[blk_idx]))
                     cached = self._allocated_gvas.get(key)
                     if cached is not None:
-                        # cached > 0: reuse the store-validated GVA.
+                        # cached > 0: reuse the GVA queried under a client lease.
                         # cached == 0: SSD-demoted marker; append 0 so
                         # batch_copy skips the block instead of writing
                         # through a stale GVA.
@@ -1881,6 +1920,7 @@ class KVPoolWorker:
 
             if all_group_gvas:
                 request.save_keys = all_group_save_keys
+                request.save_lease_keys = all_group_save_lease_keys
                 request.block_gvas_by_group_np = all_group_gvas
                 request.block_ids_by_group_np = all_group_block_ids
                 request.block_gvas_np = all_group_gvas[0]
@@ -2492,6 +2532,7 @@ class KVPoolWorker:
         """
         if isinstance(self.kv_send_thread, KVCacheStoreLayerSendingThread):
             all_save_keys: list[str] = []
+            all_save_lease_keys: list[str] = []
             for group_id in range(self.num_kv_cache_groups):
                 first_task = None
                 for layer_id in range(self.num_layers):
@@ -2506,6 +2547,7 @@ class KVPoolWorker:
                 shared = self.kv_send_thread.build_shared_data(first_task)
                 if shared is not None:
                     all_save_keys.extend(shared.save_keys)
+                    all_save_lease_keys.extend(shared.save_lease_keys)
                     for layer_id in range(self.num_layers):
                         for task in self.layer_save_tasks[layer_id]:
                             if task.group_id == group_id:
@@ -2514,10 +2556,12 @@ class KVPoolWorker:
             for tasks in self.layer_save_tasks:
                 for task in tasks:
                     task.write_finish_keys.clear()
+                    task.save_lease_release_keys.clear()
                     if task.shared_block_data is not None:
                         last_task = task
             if last_task is not None:
                 last_task.write_finish_keys.extend(dict.fromkeys(all_save_keys))
+                last_task.save_lease_release_keys.extend(dict.fromkeys(all_save_lease_keys))
         elif isinstance(self.kv_send_thread, KVCacheStoreKeyLayerSendingThread):
             first_task = None
             for layer_id in range(self.num_layers):
@@ -2666,6 +2710,7 @@ class KVPoolWorker:
         # PERF-TUNE(4): cache repeated memcache RPC results within this step.
         self._step_keyinfo_cache = {}
         self._step_lease_result = {}
+        self._step_save_lease_keys = set()
         # Mooncake uses the projected stage-local cache layout, including any
         # draft layers. The GVA/key planes retain their existing PP key count.
         if not self.use_block_key_layerwise and getattr(self, "pp_size", 1) > 1:

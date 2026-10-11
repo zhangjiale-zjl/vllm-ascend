@@ -296,6 +296,44 @@ class TestGVALayerTransferFailures(unittest.TestCase):
 
         store.batch_write_finish.assert_called_once_with(["k0"], [0])
 
+    def test_reused_gva_registration_survives_copy_and_is_released_after_finish(self):
+        thread, store, _, task = self._make_sending_thread()
+        task.shared_block_data.save_lease_keys = ["cached"]
+        task.save_lease_release_keys = ["cached", "cached"]
+        calls = []
+        store.store.batch_copy.side_effect = lambda *args: calls.append("copy") or 0
+        store.batch_write_finish.side_effect = lambda *args: calls.append("finish") or [0]
+        store.batch_remove_lease.side_effect = lambda *args: calls.append("release") or 0
+
+        thread._handle_request([task])
+
+        self.assertEqual(calls, ["copy", "finish", "release"])
+        store.batch_remove_lease.assert_called_once_with(["cached"])
+        self.assertEqual(thread._active_gva_save_leases, set())
+
+    def test_reused_save_lease_is_held_until_last_actual_layer(self):
+        thread, store, _, task = self._make_sending_thread()
+        task.shared_block_data.save_lease_keys = ["cached"]
+        task.write_finish_keys = []
+
+        thread._handle_request([task])
+
+        store.batch_remove_lease.assert_not_called()
+        self.assertEqual(thread._active_gva_save_leases, {"cached"})
+
+    def test_copy_failure_releases_reused_save_lease(self):
+        thread, store, save_finished, task = self._make_sending_thread()
+        task.shared_block_data.save_lease_keys = ["cached"]
+        store.store.batch_copy.return_value = -3102
+
+        with self.assertRaisesRegex(RuntimeError, "save batch_copy failed"):
+            thread._handle_request([task])
+
+        store.batch_remove_lease.assert_called_once_with(["cached"])
+        store.batch_write_finish.assert_not_called()
+        self.assertFalse(save_finished.is_set())
+        self.assertEqual(thread._active_gva_save_leases, set())
+
 
 class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
     def _make_thread(self, external_slot_release_waiter=None, save_failure_checker=None):

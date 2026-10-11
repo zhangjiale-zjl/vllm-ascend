@@ -1004,6 +1004,7 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        save_lease_keys: list[str] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1045,6 +1046,7 @@ class ReqMeta:
         self.load_key_block_offset = load_key_block_offset
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
+        self.save_lease_keys = [] if save_lease_keys is None else list(save_lease_keys)
 
     @property
     def block_ids(self) -> list[int]:
@@ -1057,6 +1059,7 @@ class ReqMeta:
     last_block_gva: int | None = None
     partial_block_index: int | None = None
     save_keys: list[str] | None = None
+    save_lease_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
     save_block_keys: list[str | None] = field(default_factory=list)
     save_key_block_offset: int = 0
@@ -1260,6 +1263,7 @@ class SharedBlockData:
     block_keys: list[str] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
+    save_lease_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1272,6 +1276,8 @@ class LayerTransferTask:
     # Publish newly allocated GVA keys after this task completes the final
     # actual layer copy for the batch.
     write_finish_keys: list[str] = field(default_factory=list)
+    # Release read leases protecting reused GVA destinations after the last copy.
+    save_lease_release_keys: list[str] = field(default_factory=list)
     # Cache for KVCacheStoreKeyLayerSendingThread:
     # maps block_range index -> list of (start, end, key_all_layers)
     cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None

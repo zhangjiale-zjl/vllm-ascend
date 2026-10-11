@@ -1924,6 +1924,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             req_ids=["r1"],
             is_last_chunks=[True],
             save_keys=["k0"],
+            save_lease_keys=["cached", "cached"],
         )
         send_thread = object.__new__(KVCacheStoreLayerSendingThread)
         send_thread.build_shared_data = MagicMock(return_value=shared)
@@ -1933,6 +1934,8 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
 
         self.assertEqual(first_task.write_finish_keys, [])
         self.assertEqual(last_task.write_finish_keys, ["k0"])
+        self.assertEqual(first_task.save_lease_release_keys, [])
+        self.assertEqual(last_task.save_lease_release_keys, ["cached"])
 
     def test_process_save_for_layer_batch_skip_no_save(self):
         worker = self._make_worker()
@@ -2358,6 +2361,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         resident_info.size.return_value = 64
         resident_info.gva_list.return_value = [303]
         worker.m_store.batch_get_key_info.return_value = [resident_info]
+        worker.m_store.batch_add_lease.return_value = [0]
         worker.m_store.batch_alloc.return_value = [202]
         request = ReqMeta(
             req_id="r1",
@@ -2380,6 +2384,67 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertEqual(worker._allocated_gvas[resident_key], 303)
         self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [202, 303])
         worker.m_store.batch_alloc.assert_called_once_with([fresh_key], [64], LAYERWISE_READ_LEASE_TTL_MS)
+
+        worker.m_store.batch_add_lease.assert_called_once_with([resident_key], LAYERWISE_READ_LEASE_TTL_MS)
+        self.assertEqual(request.save_lease_keys, [resident_key])
+        self.assertEqual(request.save_keys, [fresh_key])
+
+    def test_reused_save_gva_is_registered_and_queried_under_lease(self):
+        worker = self._make_gva_worker()
+        key = worker._make_layerwise_full_key(0, "h1")
+        worker._allocated_gvas[key] = 101
+        before = SimpleNamespace(size=lambda: 64, gva_list=lambda: [201])
+        pinned = SimpleNamespace(size=lambda: 64, gva_list=lambda: [301])
+        registered = set()
+
+        def add_lease(keys, ttl):
+            registered.update(keys)
+            return [0] * len(keys)
+
+        def key_info(keys):
+            return [pinned if key in registered else before]
+
+        worker.m_store.batch_add_lease.side_effect = add_lease
+        worker.m_store.batch_get_key_info.side_effect = key_info
+        worker.m_store.batch_alloc.return_value = [202]
+        request = self._make_gva_request(can_save=True)
+        request.save_end_token = request.target_token_len = 32
+        request.block_hashes = ["h0", "h1"]
+        request.block_ids_by_group_np = [np.asarray([7, 8], dtype=np.int64)]
+
+        worker._alloc_gvas_for_save([request])
+
+        self.assertEqual(registered, {key})
+        self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [202, 301])
+        self.assertEqual(request.save_lease_keys, [key])
+        worker.m_store.batch_remove_lease.assert_not_called()
+        # Repeated uses in a step share one save lease, independently of load leases.
+        self.assertEqual(worker._pin_reused_save_gvas([key, key]), [key])
+        self.assertEqual(worker.m_store.batch_add_lease.call_count, 1)
+        self.assertIs(worker._step_keyinfo_cache[key], pinned)
+
+    def test_reused_save_lease_failure_does_not_copy_unregistered_gva(self):
+        worker = self._make_gva_worker()
+        key = worker._make_layerwise_full_key(0, "h1")
+        worker._allocated_gvas[key] = 101
+        worker.m_store.batch_add_lease.return_value = [-3102]
+
+        self.assertEqual(worker._pin_reused_save_gvas([key]), [])
+
+        self.assertEqual(worker._allocated_gvas[key], 0)
+        worker.m_store.batch_get_key_info.assert_not_called()
+        worker.m_store.batch_remove_lease.assert_not_called()
+
+    def test_reused_save_metadata_failure_releases_acquired_lease(self):
+        worker = self._make_gva_worker()
+        worker.m_store.batch_add_lease.return_value = [0]
+        worker.m_store.batch_get_key_info.return_value = []
+
+        with self.assertRaisesRegex(RuntimeError, "key-info result count mismatch"):
+            worker._pin_reused_save_gvas(["cached"])
+
+        worker.m_store.batch_remove_lease.assert_called_once_with(["cached"])
+        self.assertEqual(worker._step_save_lease_keys, set())
 
     def test_partial_decode_is_saved_and_loaded_for_reused_layer(self):
         worker = self._make_worker()

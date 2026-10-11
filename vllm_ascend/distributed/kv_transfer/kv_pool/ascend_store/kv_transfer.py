@@ -275,6 +275,7 @@ class LayerBatchBuilder:
         req_ids: list[str] = []
         is_last_chunks: list[bool | None] = []
         all_save_keys: list[str] = []
+        all_save_lease_keys: list[str] = []
         all_load_keys: list[str] = []
         collected_load_keys_request_ids: set[int] = set()
         offset = 0
@@ -285,6 +286,8 @@ class LayerBatchBuilder:
             is_last_chunks.append(request.is_last_chunk)
             if request.save_keys:
                 all_save_keys.extend(request.save_keys)
+            if is_save:
+                all_save_lease_keys.extend(request.save_lease_keys)
             if request.load_keys and id(request) not in collected_load_keys_request_ids:
                 # Avoid collecting the same request's load_keys multiple times
                 collected_load_keys_request_ids.add(id(request))
@@ -347,6 +350,7 @@ class LayerBatchBuilder:
             req_ids=req_ids,
             is_last_chunks=is_last_chunks,
             save_keys=all_save_keys,
+            save_lease_keys=all_save_lease_keys,
             load_keys=all_load_keys,
         )
 
@@ -1670,6 +1674,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.write_results: dict[str, int] = {}
+        self._active_gva_save_leases: set[str] = set()
         self._put_started_keys = put_started_keys if put_started_keys is not None else set()
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
         self._session_tracker = session_tracker
@@ -1831,6 +1836,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if transfer_tasks[0].use_key_major_ranges:
             self._handle_range_layer_tasks(transfer_tasks)
             return
+        for task in transfer_tasks:
+            if task.shared_block_data is not None:
+                self._active_gva_save_leases.update(task.shared_block_data.save_lease_keys)
+        try:
+            self._handle_gva_request(transfer_tasks)
+        except Exception:
+            keys = list(self._active_gva_save_leases)
+            self._active_gva_save_leases.clear()
+            if keys:
+                try:
+                    self.m_store.batch_remove_lease(keys)
+                except Exception:
+                    logger.exception("Failed to release reused save GVA leases after transfer failure")
+            raise
+
+    def _handle_gva_request(self, transfer_tasks: list[LayerTransferTask]) -> None:
         physical_layer = transfer_tasks[0].layer_id
         has_any_save = False
         all_gvas = []
@@ -1839,6 +1860,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         all_req_ids = []
         all_save_keys: list[str] = []
         write_finish_keys: list[str] = []
+        save_lease_release_keys: list[str] = []
         for task in transfer_tasks:
             shared = task.shared_block_data
             if shared is None:
@@ -1853,6 +1875,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 all_req_ids.append(req_id)
             all_save_keys.extend(shared.save_keys)
             write_finish_keys.extend(task.write_finish_keys)
+            save_lease_release_keys.extend(task.save_lease_release_keys)
             all_gvas.append(req_meta.gvas_array)
             all_addrs.append(req_meta.addr_array)
             all_sizes.append(req_meta.size_array)
@@ -1884,6 +1907,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         f"Layerwise save batch_write_finish failed: "
                         f"expected={len(finish_keys)}, results={finish_results}"
                     )
+            if save_lease_release_keys:
+                keys = list(dict.fromkeys(save_lease_release_keys))
+                result = self.m_store.batch_remove_lease(keys)
+                if result != 0:
+                    raise RuntimeError(f"Layerwise reused save GVA lease release failed: result={result}")
+                self._active_gva_save_leases.difference_update(keys)
             for req_id in all_req_ids:
                 if self.try_finish_and_delete_stored_request(req_id):
                     self.set_finished_request(req_id)
